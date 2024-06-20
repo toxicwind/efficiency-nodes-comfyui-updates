@@ -437,10 +437,11 @@ class TSC_KSampler:
 
         # monkey patch the sample function
         original_calculation = comfy.samplers.calculate_sigmas
-        def calculate_sigmas(model_sampling, scheduler_name: str, steps):
+        def calculate_sigmas(model_sampling, scheduler_name, steps):
             if scheduler_name.startswith("AYS"):
                 return AlignYourStepsScheduler().get_sigmas(scheduler_name.split(" ")[1], steps, denoise=1.0)[0]
-            return original_calculation(model_sampling, scheduler_name, steps)
+            else:
+                return comfy.samplers.calculate_sigmas(model_sampling, scheduler_name, steps)
         comfy.samplers.SCHEDULER_NAMES = comfy.samplers.SCHEDULER_NAMES + ["AYS SD1", "AYS SDXL", "AYS SVD"]
         comfy.samplers.calculate_sigmas = calculate_sigmas
 
