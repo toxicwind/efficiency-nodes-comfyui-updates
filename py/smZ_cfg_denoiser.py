@@ -16,6 +16,7 @@ import comfy.samplers
 import inspect
 import nodes
 import inspect
+import itertools
 import functools
 import importlib
 import os
@@ -23,173 +24,194 @@ import re
 import itertools
 import comfy.sample
 import torch
-from comfy import model_management
+import torch.nn as nn
+import torch.nn.functional as F
+import gc
 
-def catenate_conds(conds):
+import comfy
+import comfy.sample
+from comfy import model_management
+from comfy.samplers import KSampler, KSamplerX0Inpaint
+
+import nodes
+
+
+def adjust_tensor_shape(
+    tensor_small: torch.Tensor, tensor_big: torch.Tensor
+) -> torch.Tensor:
+    replication_factor = (
+        tensor_big.size(1) + tensor_small.size(1) - 1
+    ) // tensor_small.size(1)
+    return tensor_small.repeat_interleave(replication_factor, dim=1)[
+        :, : tensor_big.size(1), :
+    ]
+
+
+def expand(
+    tensor1: torch.Tensor, tensor2: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if tensor1.size(1) != tensor2.size(1):
+        if tensor1.size(1) < tensor2.size(1):
+            tensor1 = adjust_tensor_shape(tensor1, tensor2)
+        else:
+            tensor2 = adjust_tensor_shape(tensor2, tensor1)
+    return tensor1, tensor2
+
+
+def bounded_modulo(number: int, modulo_value: int) -> int:
+    return number % modulo_value
+
+
+def calc_cond(c: List[Any], current_step: int) -> List[Any]:
+    grouped_by_smZ = {
+        k: list(g)
+        for k, g in itertools.groupby(
+            sorted(c, key=lambda x: x[1].get("from_smZ")),
+            key=lambda x: x[1].get("from_smZ"),
+        )
+    }
+    result_cond = []
+    for from_smZ, group in grouped_by_smZ.items():
+        grouped_by_smZid = {
+            k: list(g)
+            for k, g in itertools.groupby(
+                sorted(group, key=lambda x: x[1].get("smZid")),
+                key=lambda x: x[1].get("smZid"),
+            )
+        }
+        for smZid, group_smZid in grouped_by_smZid.items():
+            if smZid is not None:
+                orig_len = group_smZid[0][1].get("orig_len", 1)
+                i = bounded_modulo(current_step, orig_len)
+                result_cond.extend(group_smZid[i : i + 1])
+            else:
+                result_cond.extend(group_smZid)
+    return result_cond
+
+
+def catenate_conds(conds: List[Any]) -> Any:
     if not isinstance(conds[0], dict):
         return torch.cat(conds)
-
     return {key: torch.cat([x[key] for x in conds]) for key in conds[0].keys()}
 
 
-def subscript_cond(cond, a, b):
+def subscript_cond(cond: Any, a: int, b: int) -> Any:
     if not isinstance(cond, dict):
         return cond[a:b]
-
     return {key: vec[a:b] for key, vec in cond.items()}
 
 
-def pad_cond(tensor, repeats, empty):
+def pad_cond(tensor: torch.Tensor, repeats: int, empty: torch.Tensor) -> torch.Tensor:
     if not isinstance(tensor, dict):
-        return torch.cat([tensor, empty.repeat((tensor.shape[0], repeats, 1)).to(device=tensor.device)], axis=1)
-
-    tensor['crossattn'] = pad_cond(tensor['crossattn'], repeats, empty)
+        return F.pad(tensor, (0, 0, 0, repeats), "constant", 0)
+    tensor["crossattn"] = pad_cond(tensor["crossattn"], repeats, empty)
     return tensor
 
 
-class CFGDenoiser(torch.nn.Module):
-    """
-    Classifier free guidance denoiser. A wrapper for stable diffusion model (specifically for unet)
-    that can take a noisy picture and produce a noise-free picture using two guidances (prompts)
-    instead of one. Originally, the second prompt is just an empty string, but we use non-empty
-    negative prompt.
-    """
-
+class CFGDenoiser(nn.Module):
     def __init__(self, model):
         super().__init__()
         self.inner_model = model
-        self.model_wrap = None
         self.mask = None
         self.nmask = None
         self.init_latent = None
         self.steps = None
-        """number of steps as specified by user in UI"""
-
         self.total_steps = None
-        """expected number of calls to denoiser calculated from self.steps and specifics of the selected sampler"""
-
         self.step = 0
         self.image_cfg_scale = None
         self.padded_cond_uncond = False
         self.sampler = None
-        self.model_wrap = None
         self.p = None
         self.mask_before_denoising = False
 
-
     def combine_denoised(self, x_out, conds_list, uncond, cond_scale):
-        denoised_uncond = x_out[-uncond.shape[0]:]
-        denoised = torch.clone(denoised_uncond)
+        denoised_uncond = x_out[-uncond.shape[0] :]
+        denoised = denoised_uncond.clone()
 
         for i, conds in enumerate(conds_list):
-            for cond_index, weight in conds:
-                denoised[i] += (x_out[cond_index] - denoised_uncond[i]) * (weight * cond_scale)
+            denoised[i] += sum(
+                (x_out[cond_index] - denoised_uncond[i]) * weight * cond_scale
+                for cond_index, weight in conds
+            )
 
         return denoised
 
     def combine_denoised_for_edit_model(self, x_out, cond_scale):
         out_cond, out_img_cond, out_uncond = x_out.chunk(3)
-        denoised = out_uncond + cond_scale * (out_cond - out_img_cond) + self.image_cfg_scale * (out_img_cond - out_uncond)
-
-        return denoised
-
-    def get_pred_x0(self, x_in, x_out, sigma):
-        return x_out
-
-    def update_inner_model(self):
-        self.model_wrap = None
-
-        c, uc = self.p.get_conds()
-        self.sampler.sampler_extra_args['cond'] = c
-        self.sampler.sampler_extra_args['uncond'] = uc
+        return (
+            out_uncond
+            + cond_scale * (out_cond - out_img_cond)
+            + self.image_cfg_scale * (out_img_cond - out_uncond)
+        )
 
     def forward(self, x, sigma, uncond, cond, cond_scale, s_min_uncond, image_cond):
         model_management.throw_exception_if_processing_interrupted()
 
-        is_edit_model = False
-
         conds_list, tensor = cond
-        assert not is_edit_model or all(len(conds) == 1 for conds in conds_list), "AND is not supported for InstructPix2Pix checkpoint (unless using Image CFG scale = 1.0)"
-
-        if self.mask_before_denoising and self.mask is not None:
-            x = self.init_latent * self.mask + self.nmask * x
-
         batch_size = len(conds_list)
-        repeats = [len(conds_list[i]) for i in range(batch_size)]
+        repeats = [len(conds) for conds in conds_list]
 
-        if False:
-            image_uncond = torch.zeros_like(image_cond)
-            make_condition_dict = lambda c_crossattn, c_adm: {"c_crossattn": c_crossattn, "c_adm": c_adm, 'transformer_options': {'from_smZ': True}} # pylint: disable=C3001
-        else:
-            image_uncond = image_cond
-            if isinstance(uncond, dict):
-                make_condition_dict = lambda c_crossattn, c_concat: {**c_crossattn, "c_concat": None, "c_adm": x.c_adm, 'transformer_options': {'from_smZ': True}}
-            else:
-                make_condition_dict = lambda c_crossattn, c_concat: {"c_crossattn": c_crossattn, "c_concat": None, "c_adm": x.c_adm, 'transformer_options': {'from_smZ': True}}
+        x_in, sigma_in, image_cond_in = self.prepare_inputs(
+            x, sigma, image_cond, repeats, uncond, s_min_uncond
+        )
 
-        if not is_edit_model:
-            x_in = torch.cat([torch.stack([x[i] for _ in range(n)]) for i, n in enumerate(repeats)] + [x])
-            sigma_in = torch.cat([torch.stack([sigma[i] for _ in range(n)]) for i, n in enumerate(repeats)] + [sigma])
-            image_cond_in = torch.cat([torch.stack([image_cond[i] for _ in range(n)]) for i, n in enumerate(repeats)] + [image_uncond])
-        else:
-            x_in = torch.cat([torch.stack([x[i] for _ in range(n)]) for i, n in enumerate(repeats)] + [x] + [x])
-            sigma_in = torch.cat([torch.stack([sigma[i] for _ in range(n)]) for i, n in enumerate(repeats)] + [sigma] + [sigma])
-            image_cond_in = torch.cat([torch.stack([image_cond[i] for _ in range(n)]) for i, n in enumerate(repeats)] + [image_uncond] + [torch.zeros_like(self.init_latent)])
+        cond_in = self.prepare_cond(tensor, uncond, repeats, s_min_uncond)
 
-        skip_uncond = False
+        x_out = self.apply_model(x_in, sigma_in, cond_in, image_cond_in, batch_size)
 
-        # alternating uncond allows for higher thresholds without the quality loss normally expected from raising it
-        if self.step % 2 and s_min_uncond > 0 and sigma[0] < s_min_uncond and not is_edit_model:
-            skip_uncond = True
-            x_in = x_in[:-batch_size]
-            sigma_in = sigma_in[:-batch_size]
+        denoised = self.post_process(
+            x_out, conds_list, uncond, cond_scale, s_min_uncond
+        )
 
-        if tensor.shape[1] == uncond.shape[1] or skip_uncond:
-            if is_edit_model:
-                cond_in = catenate_conds([tensor, uncond, uncond])
-            elif skip_uncond:
-                cond_in = tensor
-            else:
-                cond_in = catenate_conds([tensor, uncond])
+        return denoised
 
-            x_out = torch.zeros_like(x_in)
-            for batch_offset in range(0, x_out.shape[0], batch_size):
-                a = batch_offset
-                b = a + batch_size
-                x_out[a:b] = self.inner_model(x_in[a:b], sigma_in[a:b], **make_condition_dict(subscript_cond(cond_in, a, b), image_cond_in[a:b]))
-        else:
-            x_out = torch.zeros_like(x_in)
-            for batch_offset in range(0, tensor.shape[0], batch_size):
-                a = batch_offset
-                b = min(a + batch_size, tensor.shape[0])
+    def prepare_inputs(self, x, sigma, image_cond, repeats, uncond, s_min_uncond):
+        x_in = torch.cat(
+            [x[i].expand(n, -1, -1, -1) for i, n in enumerate(repeats)] + [x]
+        )
+        sigma_in = torch.cat(
+            [sigma[i].expand(n) for i, n in enumerate(repeats)] + [sigma]
+        )
+        image_cond_in = torch.cat(
+            [image_cond[i].expand(n, -1, -1, -1) for i, n in enumerate(repeats)]
+            + [image_cond]
+        )
 
-                if not is_edit_model:
-                    c_crossattn = subscript_cond(tensor, a, b)
-                else:
-                    c_crossattn = torch.cat([tensor[a:b]], uncond)
+        if self.step % 2 and s_min_uncond > 0 and sigma[0] < s_min_uncond:
+            x_in = x_in[: -len(repeats)]
+            sigma_in = sigma_in[: -len(repeats)]
 
-                x_out[a:b] = self.inner_model(x_in[a:b], sigma_in[a:b], **make_condition_dict(c_crossattn, image_cond_in[a:b]))
+        return x_in, sigma_in, image_cond_in
 
-            if not skip_uncond:
-                x_out[-uncond.shape[0]:] = self.inner_model(x_in[-uncond.shape[0]:], sigma_in[-uncond.shape[0]:], **make_condition_dict(uncond, image_cond_in[-uncond.shape[0]:]))
+    def prepare_cond(self, tensor, uncond, repeats, s_min_uncond):
+        if self.step % 2 and s_min_uncond > 0 and tensor.shape[1] == uncond.shape[1]:
+            return torch.cat([tensor] * sum(repeats) + [uncond])
+        return torch.cat([tensor] * sum(repeats))
 
-        denoised_image_indexes = [x[0][0] for x in conds_list]
-        if skip_uncond:
-            fake_uncond = torch.cat([x_out[i:i+1] for i in denoised_image_indexes])
-            x_out = torch.cat([x_out, fake_uncond])  # we skipped uncond denoising, so we put cond-denoised image to where the uncond-denoised image should be
+    def apply_model(self, x_in, sigma_in, cond_in, image_cond_in, batch_size):
+        x_out = torch.zeros_like(x_in)
+        for batch_offset in range(0, x_in.shape[0], batch_size):
+            batch_slice = slice(batch_offset, batch_offset + batch_size)
+            x_out[batch_slice] = self.inner_model(
+                x_in[batch_slice],
+                sigma_in[batch_slice],
+                cond_in[batch_slice],
+                image_cond_in[batch_slice],
+            )
+        return x_out
 
-        if is_edit_model:
-            denoised = self.combine_denoised_for_edit_model(x_out, cond_scale)
-        elif skip_uncond:
-            denoised = self.combine_denoised(x_out, conds_list, uncond, 1.0)
-        else:
-            denoised = self.combine_denoised(x_out, conds_list, uncond, cond_scale)
+    def post_process(self, x_out, conds_list, uncond, cond_scale, s_min_uncond):
+        if self.step % 2 and s_min_uncond > 0:
+            denoised_image_indexes = [x[0][0] for x in conds_list]
+            fake_uncond = torch.cat([x_out[i : i + 1] for i in denoised_image_indexes])
+            x_out = torch.cat([x_out, fake_uncond])
+
+        denoised = self.combine_denoised(x_out, conds_list, uncond, cond_scale)
 
         if not self.mask_before_denoising and self.mask is not None:
             denoised = self.init_latent * self.mask + self.nmask * denoised
 
         self.step += 1
-        del x_out
         return denoised
 
 # ========================================================================
